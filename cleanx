@@ -1,0 +1,680 @@
+#!/usr/bin/env bash
+#
+# cleanX: an interactive cleaner for the disk space Xcode quietly eats.
+# https://github.com/hlum/cleanX
+#
+# Written for the stock macOS bash (3.2): no associative arrays, no mapfile.
+
+VERSION="1.0.0"
+DEV="$HOME/Library/Developer"
+CACHES="$HOME/Library/Caches"
+DRY_RUN=0
+ASSUME_YES=0
+HAS_SIMCTL=0
+
+# ---------------------------------------------------------------- output ---
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLU=$'\033[34m'; CYN=$'\033[36m'
+else
+  B=; D=; R=; RED=; GRN=; YLW=; BLU=; CYN=
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$BLU$B" "$R" "$*"; }
+ok()   { printf '%s ✓ %s %s\n' "$GRN$B" "$R" "$*"; }
+warn() { printf '%s ! %s %s\n' "$YLW$B" "$R" "$*"; }
+err()  { printf '%s ✗ %s %s\n' "$RED$B" "$R" "$*" >&2; }
+
+# Wrap text to the terminal width with a left indent.
+wrap() {
+  local cols; cols=$(tput cols 2>/dev/null || echo 80)
+  [ "$cols" -gt 100 ] && cols=100
+  printf '%s\n' "$2" | fold -s -w $((cols - $1)) | sed "s/^/$(printf '%*s' "$1" '')/"
+}
+
+human() { # KB -> "12.3 GB"
+  awk -v k="${1:-0}" 'BEGIN { split("KB MB GB TB", u, " "); i = 1
+    while (k >= 1024 && i < 4) { k /= 1024; i++ }
+    if (i == 1) printf "%d %s", k, u[i]; else printf "%.1f %s", k, u[i] }'
+}
+
+to_kb() { # "7.5G" / "512M" / bytes -> KB
+  awk -v s="$1" 'BEGIN { n = s + 0; u = substr(s, length(s))
+    m = (u == "K") ? 1 : (u == "M") ? 1024 : (u == "G") ? 1048576 : (u == "T") ? 1073741824 : 1 / 1024
+    printf "%d", n * m }'
+}
+
+kb_of() { # total size in KB of the given paths (missing ones count as 0)
+  local total=0 p s
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    s=$(du -skx "$p" 2>/dev/null | awk '{print $1}')
+    total=$((total + ${s:-0}))
+  done
+  echo "$total"
+}
+
+free_kb() { df -k "$HOME" | awk 'NR==2 {print $4}'; }
+
+badge() {
+  case "$1" in
+    safe)    printf '%s● SAFE%s' "$GRN" "$R" ;;
+    caution) printf '%s● CAUTION%s' "$YLW" "$R" ;;
+    danger)  printf '%s● RISKY%s' "$RED" "$R" ;;
+  esac
+}
+
+badge_meaning() {
+  case "$1" in
+    safe)    echo "Regenerated automatically. Deleting costs you, at worst, some rebuild or re-download time." ;;
+    caution) echo "Nothing breaks, but you lose data or have to re-download something big. Pick what to remove." ;;
+    danger)  echo "Can't be recreated. Only delete if you're sure you don't need it." ;;
+  esac
+}
+
+confirm() {
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  local a
+  printf '%s %s[y/N]%s ' "$1" "$D" "$R"
+  read -r a || return 1
+  case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+pause() { [ "$ASSUME_YES" -eq 1 ] || { printf '%sPress Enter to continue…%s' "$D" "$R"; read -r _; }; }
+
+# ------------------------------------------------------- safe deletion ---
+
+# Refuse to touch anything outside the places cleanX knows about.
+guard() {
+  case "$1" in
+    "$HOME"/Library/Developer/CoreDevice*) ;; # virtual mount of a connected iPhone, not Mac storage
+    /Applications/Xcode*.app) return 0 ;;
+    "$HOME"/Library/Developer/?*|"$HOME"/Library/Caches/?*|"$HOME"/Library/Logs/?*)
+      # Never cross into another mounted filesystem (device mirrors, disk images).
+      local probe=$1; while [ ! -e "$probe" ]; do probe=$(dirname "$probe"); done
+      [ "$(stat -f %d "$probe")" = "$(stat -f %d "$HOME")" ] && return 0 ;;
+  esac
+  err "Refusing to delete unexpected path: $1"
+  return 1
+}
+
+run() { # run a command, or just print it in dry-run mode
+  if [ "$DRY_RUN" -eq 1 ]; then say "   ${D}[dry-run] $*${R}"; else "$@"; fi
+}
+
+nuke() { # delete one path
+  guard "$1" || return 1
+  [ -e "$1" ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then say "   ${D}[dry-run] rm -rf \"$1\"${R}"; return 0; fi
+  rm -rf "$1" 2>/dev/null || warn "Some files in $1 couldn't be removed (in use or protected by macOS)."
+}
+
+empty_dir() { # delete everything inside a directory but keep the directory
+  [ -d "$1" ] || return 0
+  guard "$1/x" || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then say "   ${D}[dry-run] empty \"$1\"${R}"; return 0; fi
+  find -x "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null ||
+    warn "Some files in $1 couldn't be removed (in use or protected by macOS)."
+}
+
+# ------------------------------------------------------------ registry ---
+#
+# Each item has: id, name, safety (safe|caution|danger), paths ("|"-separated),
+# and three explanations. An item can define size_<id> and clean_<id> to
+# override the default "measure the paths" / "empty the paths" behaviour.
+# clean_<id> gets "all" as $1 when run non-interactively (clean-all-safe).
+
+N=0
+add() {
+  IDS[N]=$1; NAMES[N]=$2; SAFETY[N]=$3; PATHS[N]=$4
+  WHAT[N]=$5; PROS[N]=$6; CONS[N]=$7; SIZES[N]=0
+  N=$((N + 1))
+}
+
+add derived "DerivedData (build cache)" safe \
+  "$DEV/Xcode/DerivedData" \
+  "Xcode's build folder: compiled object files, indexes, module caches and build products for every project you've ever opened, one folder per project. Xcode never cleans it up by itself." \
+  "Usually one of the biggest wins. It also fixes a lot of weird build, indexing and autocomplete problems." \
+  "The next build of each project is a full (slower) build and Xcode re-indexes. Nothing is lost."
+
+add testclones "Parallel testing clones" safe \
+  "$DEV/XCTestDevices" \
+  "Copies of simulators that Xcode makes when it runs tests in parallel (one clone per test worker). They're meant to be temporary but they pile up, often to tens or even hundreds of GB." \
+  "Often huge, and useless once your tests have finished." \
+  "None. Xcode makes fresh clones the next time you run parallel tests."
+
+add unavail "Unavailable simulators" safe \
+  "$DEV/CoreSimulator/Devices" \
+  "Simulators whose iOS runtime isn't installed anymore, usually left behind after an Xcode update. They can't boot." \
+  "Removes dead devices along with the app data stuck inside them." \
+  "None. They can't run without their old runtime anyway."
+
+add sims "Simulator devices" caution \
+  "$DEV/CoreSimulator/Devices" \
+  "Each simulator is a full virtual device with its own installed apps, data, photos, keychain and settings. Xcode creates a whole set of devices for every runtime you install." \
+  "Simulators with apps and media in them can take several GB each, and most people only use one or two." \
+  "Everything inside a deleted simulator is gone: installed apps, login state, test data. You can recreate empty devices any time in Xcode › Window › Devices and Simulators."
+
+add runtimes "Simulator runtimes (iOS versions)" caution \
+  "managed by Xcode (xcrun simctl runtime)" \
+  "The actual iOS / watchOS / tvOS / visionOS system images that simulators boot. Each one is roughly 5–10 GB." \
+  "Removing OS versions you don't test on frees a lot of space." \
+  "Simulators that use that runtime become unavailable. If you need that version again you'll have to re-download several GB from Xcode › Settings › Components."
+
+add devicesupport "Device support files" safe \
+  "$DEV/Xcode/iOS DeviceSupport|$DEV/Xcode/watchOS DeviceSupport|$DEV/Xcode/tvOS DeviceSupport|$DEV/Xcode/visionOS DeviceSupport|$DEV/Xcode/macOS DeviceSupport" \
+  "Debug symbols that Xcode copies from each physical device you plug in, once per device model and OS version, so it can debug on it and symbolicate crashes. That's about 3–7 GB each time." \
+  "Old OS versions you no longer run are just dead weight." \
+  "The next time you connect a device on that OS, Xcode spends a few minutes on 'Preparing device' to copy the symbols again."
+
+add previews "SwiftUI Previews" safe \
+  "$DEV/Xcode/UserData/Previews" \
+  "Hidden simulators and builds that power SwiftUI / #Preview canvases." \
+  "Can be several GB, and clearing it also fixes a stuck or crashing preview canvas." \
+  "Previews take longer to appear the first time afterwards."
+
+add xcodecache "Xcode & simulator caches" safe \
+  "$CACHES/com.apple.dt.Xcode|$DEV/Xcode/DocumentationCache|$DEV/Xcode/Products|$DEV/CoreSimulator/Caches" \
+  "Miscellaneous caches: Xcode's own app cache, the downloaded documentation cache, exported products, and the simulator's per-user caches." \
+  "Safe housekeeping that sometimes fixes glitches too." \
+  "Xcode rebuilds them as needed, so the first launch or docs lookup may be a bit slower."
+
+add logs "Simulator & device logs" safe \
+  "$HOME/Library/Logs/CoreSimulator|$DEV/Xcode/iOS Device Logs|$DEV/Xcode/watchOS Device Logs" \
+  "Log files written by the simulator, plus logs pulled off physical devices." \
+  "Pure clutter for most people." \
+  "You lose old logs you might have wanted for debugging."
+
+add spm "Swift Package Manager cache" safe \
+  "$CACHES/org.swift.swiftpm" \
+  "Global cache of cloned Swift packages, shared by all your projects." \
+  "Frees space taken by packages you no longer use." \
+  "Packages are downloaded again the next time a project resolves them (you need internet for that)."
+
+add cocoapods "CocoaPods cache" safe \
+  "$CACHES/CocoaPods" \
+  "Downloaded pod sources and specs cached by CocoaPods." \
+  "Frees space. Your projects' own Pods folders aren't touched." \
+  "The next 'pod install' downloads pods again."
+
+add carthage "Carthage cache" safe \
+  "$CACHES/org.carthage.CarthageKit" \
+  "Downloaded dependencies and binaries cached by Carthage." \
+  "Frees space. Your projects' Carthage folders aren't touched." \
+  "The next 'carthage bootstrap' downloads everything again."
+
+add archives "Archives (App Store builds)" danger \
+  "$DEV/Xcode/Archives" \
+  "Every build you've made with Product › Archive, i.e. what you upload to TestFlight or the App Store. Each one contains the app plus its dSYM debug symbols." \
+  "Archives of versions nobody runs anymore can go." \
+  "dSYMs are what turn crash reports from released versions into readable stack traces, and you can't recreate them for a given build (unless App Store Connect or your crash reporter has them). Keep archives for any version still in users' hands."
+
+add xcodeapps "Other Xcode versions" caution \
+  "/Applications/Xcode*.app" \
+  "Extra copies of Xcode (betas, old versions) in /Applications, each one 8–12+ GB. The Xcode currently selected with xcode-select is never listed." \
+  "A huge win if you've kept old or beta Xcodes around." \
+  "If a project needs that version again you'll have to re-download it from developer.apple.com (slow)."
+
+split_paths() { IFS='|' read -r -a ITEM_PATHS <<< "${PATHS[$1]}"; }
+
+# ------------------------------------------------------------ simulators ---
+
+load_devices() {
+  DEV_UUID=(); DEV_NAME=(); DEV_RT=(); DEV_STATE=(); DEV_OK=()
+  [ "$HAS_SIMCTL" -eq 1 ] || return 0
+  local rt="" line i
+  local re_h='^-- (.*) --$'
+  local re_d='^ +(.*) \(([0-9A-F-]{36})\) \(([^)]*)\)'
+  while IFS= read -r line; do
+    if [[ $line =~ $re_h ]]; then
+      rt=${BASH_REMATCH[1]}
+    elif [[ $line =~ $re_d ]]; then
+      i=${#DEV_UUID[@]}
+      DEV_NAME[i]=${BASH_REMATCH[1]}; DEV_UUID[i]=${BASH_REMATCH[2]}
+      DEV_STATE[i]=${BASH_REMATCH[3]}; DEV_RT[i]=$rt
+      case "$line" in *unavailable*) DEV_OK[i]=0 ;; *) DEV_OK[i]=1 ;; esac
+    fi
+  done < <(xcrun simctl list devices 2>/dev/null)
+}
+
+load_runtimes() {
+  RT_ID=(); RT_NAME=(); RT_SIZE=(); RT_USED=(); RT_DEL=()
+  [ "$HAS_SIMCTL" -eq 1 ] || return 0
+  local line i=-1
+  local re_h='^([A-Za-z].*) - ([0-9A-F-]{36})'
+  while IFS= read -r line; do
+    if [[ $line =~ $re_h ]]; then
+      i=$((i + 1))
+      RT_NAME[i]=${BASH_REMATCH[1]}; RT_ID[i]=${BASH_REMATCH[2]}
+      RT_SIZE[i]=0; RT_USED[i]="?"; RT_DEL[i]="YES"
+    elif [ $i -ge 0 ]; then
+      case "$line" in
+        *"Size: "*)         RT_SIZE[i]=$(to_kb "${line##*Size: }") ;;
+        *"Last Used At: "*) RT_USED[i]=${line##*Last Used At: }; RT_USED[i]=${RT_USED[i]%% *} ;;
+        *"Deletable: "*)    RT_DEL[i]=${line##*Deletable: } ;;
+      esac
+    fi
+  done < <(xcrun simctl runtime list -v 2>/dev/null)
+}
+
+device_kb() { kb_of "$DEV/CoreSimulator/Devices/$1"; }
+
+size_unavail() {
+  local i=0 total=0
+  while [ $i -lt ${#DEV_UUID[@]} ]; do
+    [ "${DEV_OK[i]}" = 0 ] && total=$((total + $(device_kb "${DEV_UUID[i]}")))
+    i=$((i + 1))
+  done
+  echo "$total"
+}
+
+size_sims() {
+  local all; all=$(kb_of "$DEV/CoreSimulator/Devices")
+  echo $((all - $(size_unavail)))
+}
+
+size_runtimes() {
+  local i=0 total=0
+  while [ $i -lt ${#RT_ID[@]} ]; do total=$((total + RT_SIZE[i])); i=$((i + 1)); done
+  echo "$total"
+}
+
+need_simctl() {
+  [ "$HAS_SIMCTL" -eq 1 ] && return 0
+  warn "xcrun simctl isn't available. Install Xcode and run 'sudo xcode-select -s /Applications/Xcode.app'."
+  return 1
+}
+
+clean_testclones() {
+  need_simctl && run xcrun simctl --set testing delete all >/dev/null 2>&1
+  empty_dir "$DEV/XCTestDevices"
+}
+
+clean_unavail() {
+  need_simctl || return 0
+  run xcrun simctl delete unavailable
+}
+
+clean_sims() {
+  need_simctl || return 0
+  local idx=() i=0 n
+  while [ $i -lt ${#DEV_UUID[@]} ]; do
+    [ "${DEV_OK[i]}" = 1 ] && idx+=("$i")
+    i=$((i + 1))
+  done
+  n=${#idx[@]}
+  if [ "$n" -eq 0 ]; then say "   No simulators found."; return 0; fi
+
+  say ""; say "${B}Your simulators${R}"
+  i=0
+  while [ $i -lt "$n" ]; do
+    local d=${idx[i]}
+    printf '  %s%3d)%s %-34s %-12s %-10s %10s\n' "$CYN" $((i + 1)) "$R" "${DEV_NAME[d]}" \
+      "${DEV_RT[d]}" "${DEV_STATE[d]}" "$(human "$(device_kb "${DEV_UUID[d]}")")"
+    i=$((i + 1))
+  done
+  say "  ${D}Tip: 'keep 1' deletes every simulator except #1.${R}"
+  pick "$n" || { say "   Cancelled."; return 0; }
+
+  say ""; say "Will delete:"
+  for i in "${PICKED[@]}"; do say "   - ${DEV_NAME[${idx[i]}]} (${DEV_RT[${idx[i]}]})"; done
+  confirm "Delete ${#PICKED[@]} simulator(s) and all their data?" || { say "   Cancelled."; return 0; }
+  for i in "${PICKED[@]}"; do
+    local d=${idx[i]}
+    [ "${DEV_STATE[d]}" = "Booted" ] && run xcrun simctl shutdown "${DEV_UUID[d]}" 2>/dev/null
+    run xcrun simctl delete "${DEV_UUID[d]}" && say "   deleted ${DEV_NAME[d]}"
+  done
+}
+
+clean_runtimes() {
+  need_simctl || return 0
+  local n=${#RT_ID[@]} i=0
+  if [ "$n" -eq 0 ]; then say "   No removable runtimes found."; return 0; fi
+
+  say ""; say "${B}Installed simulator runtimes${R}"
+  while [ $i -lt "$n" ]; do
+    local note=""
+    [ "${RT_DEL[i]}" != "YES" ] && note="${D}(not deletable)${R}"
+    printf '  %s%3d)%s %-36s last used %-12s %10s %s\n' "$CYN" $((i + 1)) "$R" "${RT_NAME[i]}" \
+      "${RT_USED[i]}" "$(human "${RT_SIZE[i]}")" "$note"
+    i=$((i + 1))
+  done
+  pick "$n" || { say "   Cancelled."; return 0; }
+
+  say ""; say "Will delete:"
+  for i in "${PICKED[@]}"; do say "   - ${RT_NAME[i]}"; done
+  warn "Simulators that use these runtimes will stop working."
+  confirm "Delete ${#PICKED[@]} runtime(s)?" || { say "   Cancelled."; return 0; }
+  for i in "${PICKED[@]}"; do
+    run xcrun simctl runtime delete "${RT_ID[i]}" && say "   deleted ${RT_NAME[i]}"
+  done
+}
+
+# -------------------------------------------------------- folder pickers ---
+
+label_of() {
+  local p=$1 v
+  case "$p" in
+    *.app)
+      v=$(defaults read "$p/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+      echo "$(basename "$p")${v:+ ($v)}" ;;
+    *.xcarchive)
+      echo "$(basename "$(dirname "$p")")  $(basename "$p" .xcarchive)" ;;
+    *)
+      echo "$(basename "$(dirname "$p")") › $(basename "$p")" ;;
+  esac
+}
+
+# pick_paths <title> <path>...: list folders with sizes, delete the chosen ones.
+pick_paths() {
+  local title=$1; shift
+  local paths=("$@") n=$# i=0
+  if [ "$n" -eq 0 ]; then say "   Nothing to clean here."; return 0; fi
+
+  say ""; say "${B}$title${R}"
+  while [ $i -lt "$n" ]; do
+    printf '  %s%3d)%s %-62s %10s\n' "$CYN" $((i + 1)) "$R" "$(label_of "${paths[i]}")" \
+      "$(human "$(kb_of "${paths[i]}")")"
+    i=$((i + 1))
+  done
+  pick "$n" || { say "   Cancelled."; return 0; }
+
+  say ""; say "Will delete:"
+  for i in "${PICKED[@]}"; do say "   - $(label_of "${paths[i]}")"; done
+  confirm "Delete ${#PICKED[@]} item(s)?" || { say "   Cancelled."; return 0; }
+  for i in "${PICKED[@]}"; do nuke "${paths[i]}"; done
+}
+
+subdirs() { # direct children of the given dirs
+  local d
+  for d in "$@"; do [ -d "$d" ] && find "$d" -mindepth 1 -maxdepth 1 -not -name '.*'; done
+}
+
+clean_devicesupport() {
+  split_paths "$1"
+  if [ "${2:-}" = all ]; then
+    local p; for p in "${ITEM_PATHS[@]}"; do empty_dir "$p"; done; return
+  fi
+  local list=() line
+  while IFS= read -r line; do list+=("$line"); done < <(subdirs "${ITEM_PATHS[@]}" | sort)
+  pick_paths "Device support folders (device model + OS version)" ${list[@]+"${list[@]}"}
+}
+
+clean_archives() {
+  local list=() line
+  while IFS= read -r line; do list+=("$line"); done < <(find "$DEV/Xcode/Archives" -maxdepth 2 -name '*.xcarchive' 2>/dev/null | sort)
+  warn "Keep archives for any version that's still live. Their dSYMs are needed to read crash reports."
+  pick_paths "Archives (oldest first)" ${list[@]+"${list[@]}"}
+}
+
+active_xcode() { xcode-select -p 2>/dev/null | sed 's|/Contents/Developer$||'; }
+
+other_xcodes() {
+  local a active; active=$(active_xcode)
+  for a in /Applications/Xcode*.app; do
+    [ -d "$a" ] && [ "$a" != "$active" ] && echo "$a"
+  done
+}
+
+size_xcodeapps() {
+  local list=() line
+  while IFS= read -r line; do list+=("$line"); done < <(other_xcodes)
+  kb_of ${list[@]+"${list[@]}"}
+}
+
+clean_xcodeapps() {
+  local list=() line
+  while IFS= read -r line; do list+=("$line"); done < <(other_xcodes)
+  say "   Active Xcode (never touched): ${B}$(active_xcode)${R}"
+  pick_paths "Other Xcode installs" ${list[@]+"${list[@]}"}
+}
+
+# Reads "1 3 5-7", "all", or "keep 2" for <count> items into PICKED (0-based).
+pick() {
+  local count=$1 input tok a b i keep=0 sel=()
+  local re_range='^([0-9]+)-([0-9]+)$' re_num='^[0-9]+$'
+  PICKED=()
+  printf '%sSelect%s %s(e.g. 1 3 5-7 · all · keep 2 · Enter to cancel):%s ' "$B" "$R" "$D" "$R"
+  read -r input || return 1
+  case "$input" in
+    "") return 1 ;;
+    all) input="1-$count" ;;
+    keep\ *) keep=1; input=${input#keep } ;;
+  esac
+  for tok in $input; do
+    if [[ $tok =~ $re_range ]]; then a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+    elif [[ $tok =~ $re_num ]]; then a=$((10#$tok)); b=$a
+    else warn "Ignoring '$tok'"; continue
+    fi
+    while [ "$a" -le "$b" ]; do
+      if [ "$a" -ge 1 ] && [ "$a" -le "$count" ]; then sel[a - 1]=1; else warn "There's no #$a"; fi
+      a=$((a + 1))
+    done
+  done
+  i=0
+  while [ $i -lt "$count" ]; do
+    if [ $keep -eq 1 ]; then [ -z "${sel[i]:-}" ] && PICKED+=("$i")
+    else [ -n "${sel[i]:-}" ] && PICKED+=("$i")
+    fi
+    i=$((i + 1))
+  done
+  [ ${#PICKED[@]} -gt 0 ]
+}
+
+# ---------------------------------------------------------- scan & clean ---
+
+measure() { # measure item $1 into SIZES
+  local id=${IDS[$1]}
+  if declare -F "size_$id" >/dev/null; then
+    SIZES[$1]=$("size_$id")
+  else
+    split_paths "$1"
+    SIZES[$1]=$(kb_of "${ITEM_PATHS[@]}")
+  fi
+}
+
+scan() {
+  load_devices
+  load_runtimes
+  local i=0
+  while [ $i -lt $N ]; do
+    [ -t 1 ] && printf '\r\033[K  %sScanning %s…%s' "$D" "${NAMES[i]}" "$R"
+    measure $i
+    i=$((i + 1))
+  done
+  [ -t 1 ] && printf '\r\033[K'
+}
+
+# Clean item $1. "all" as $2 means non-interactive (only used for safe items).
+clean_item() {
+  local id=${IDS[$1]}
+  if declare -F "clean_$id" >/dev/null; then
+    case "$id" in
+      devicesupport) clean_devicesupport "$1" "${2:-}" ;;
+      *) "clean_$id" "${2:-}" ;;
+    esac
+  else
+    split_paths "$1"
+    local p; for p in "${ITEM_PATHS[@]}"; do empty_dir "$p"; done
+  fi
+}
+
+# Items whose clean step asks the user which things to remove.
+is_picker() { case "${IDS[$1]}" in sims|runtimes|devicesupport|archives|xcodeapps) return 0 ;; esac; return 1; }
+
+report_freed() {
+  local before=$1 after; after=$(free_kb)
+  if [ "$DRY_RUN" -eq 1 ]; then say "   ${D}Dry run, nothing was deleted.${R}"; return; fi
+  if [ "$after" -gt "$before" ]; then
+    ok "Freed $(human $((after - before))). Free space is now $(human "$after")."
+  else
+    ok "Done. Free space: $(human "$after")."
+    say "   ${D}(APFS sometimes takes a minute to report reclaimed space.)${R}"
+  fi
+}
+
+print_table() {
+  local i=0 total=0 safe=0 sz
+  say ""
+  printf '  %s%-4s %-36s %11s   %s%s\n' "$B" "#" "What" "Size" "Safety" "$R"
+  printf '  %s%s%s\n' "$D" "────────────────────────────────────────────────────────────────" "$R"
+  while [ $i -lt $N ]; do
+    sz=${SIZES[i]}
+    total=$((total + sz))
+    [ "${SAFETY[i]}" = safe ] && safe=$((safe + sz))
+    if [ "$sz" -gt 0 ]; then
+      printf '  %s%-4s%s %-36s %11s   %s\n' "$CYN" "$((i + 1))" "$R" "${NAMES[i]}" "$(human "$sz")" "$(badge "${SAFETY[i]}")"
+    else
+      printf '  %s%-4s %-36s %11s   empty%s\n' "$D" "$((i + 1))" "${NAMES[i]}" "-" "$R"
+    fi
+    i=$((i + 1))
+  done
+  printf '  %s%s%s\n' "$D" "────────────────────────────────────────────────────────────────" "$R"
+  printf '  %-41s %11s\n' "Total Xcode footprint" "$(human $total)"
+  printf '  %-41s %s%11s%s\n' "Safe to clean right now" "$GRN$B" "$(human $safe)" "$R"
+  printf '  %-41s %11s\n' "Free disk space" "$(human "$(free_kb)")"
+  say ""
+}
+
+details() {
+  local i=$1 p
+  say ""
+  say "${B}${NAMES[i]}${R}   $(badge "${SAFETY[i]}")   $(human "${SIZES[i]}")"
+  wrap 3 "$(badge_meaning "${SAFETY[i]}")" | sed "s/^/$D/;s/$/$R/"
+  say ""
+  say "  ${B}Where${R}"
+  split_paths "$i"
+  for p in "${ITEM_PATHS[@]}"; do say "   ${p/#$HOME/~}"; done
+  say ""
+  say "  ${B}What it is${R}";            wrap 3 "${WHAT[i]}"; say ""
+  say "  ${GRN}${B}Pros of deleting${R}"; wrap 3 "${PROS[i]}"; say ""
+  say "  ${RED}${B}Cons of deleting${R}"; wrap 3 "${CONS[i]}"; say ""
+}
+
+open_item() {
+  local i=$1 before
+  details "$i"
+  if [ "${SIZES[i]}" -eq 0 ] && ! is_picker "$i"; then say "   Nothing to clean here."; pause; return; fi
+  before=$(free_kb)
+  if is_picker "$i"; then
+    clean_item "$i"
+  else
+    confirm "Delete ${NAMES[i]} ($(human "${SIZES[i]}"))?" || { say "   Skipped."; return; }
+    clean_item "$i"
+  fi
+  report_freed "$before"
+  load_devices; load_runtimes; measure "$i"
+  pause
+}
+
+clean_all_safe() {
+  local i=0 list=() total=0 before
+  while [ $i -lt $N ]; do
+    if [ "${SAFETY[i]}" = safe ] && [ "${SIZES[i]}" -gt 0 ]; then
+      list+=("$i"); total=$((total + SIZES[i]))
+    fi
+    i=$((i + 1))
+  done
+  if [ ${#list[@]} -eq 0 ]; then ok "Nothing safe left to clean."; return; fi
+
+  say ""; say "${B}These are all regenerated automatically:${R}"
+  for i in "${list[@]}"; do printf '   %-38s %11s\n' "${NAMES[i]}" "$(human "${SIZES[i]}")"; done
+  say ""
+  confirm "Clean all of them ($(human $total))?" || { say "   Cancelled."; return; }
+  before=$(free_kb)
+  for i in "${list[@]}"; do info "Cleaning ${NAMES[i]}"; clean_item "$i" all; done
+  report_freed "$before"
+  scan
+}
+
+warn_running() {
+  local apps=() a
+  for a in Xcode Simulator; do pgrep -xq "$a" && apps+=("$a"); done
+  [ ${#apps[@]} -eq 0 ] && return 0
+  warn "${apps[*]} is running. Quit it first so files aren't in use."
+  confirm "Continue anyway?" || exit 0
+}
+
+usage() {
+  cat <<EOF
+${B}cleanX${R} $VERSION: clean up the disk space Xcode eats, and understand what you're deleting.
+
+${B}Usage${R}
+  cleanx              Interactive mode (recommended)
+  cleanx --scan       Show what's using space, then exit
+  cleanx --safe       Clean every item marked SAFE (asks once)
+  cleanx --dry-run    Show what would be deleted without deleting anything
+
+${B}Options${R}
+  -n, --dry-run       Never delete; print what would happen
+  -y, --yes           Don't ask for confirmation (with --safe)
+  -h, --help          Show this help
+  -v, --version       Show the version
+
+Interactive keys: [number] explain & clean · s clean all safe · r rescan · d toggle dry-run · q quit
+EOF
+}
+
+banner() {
+  say ""
+  say "  ${CYN}${B}cleanX${R} ${D}v$VERSION · the Xcode disk-space cleaner${R}"
+  [ "$DRY_RUN" -eq 1 ] && say "  ${YLW}${B}DRY RUN${R}${YLW}: nothing will actually be deleted${R}"
+}
+
+interactive() {
+  local choice
+  banner
+  warn_running
+  scan
+  while true; do
+    print_table
+    printf '%s[1-%d]%s explain & clean  %ss%s clean all SAFE  %sr%s rescan  %sd%s dry-run %s  %sq%s quit\n> ' \
+      "$CYN" "$N" "$R" "$CYN" "$R" "$CYN" "$R" "$CYN" "$R" "$([ "$DRY_RUN" -eq 1 ] && echo on || echo off)" "$CYN" "$R"
+    read -r choice || { say ""; exit 0; }
+    case "$choice" in
+      q|Q|quit|exit) say "Bye 👋"; exit 0 ;;
+      s|S) clean_all_safe ;;
+      r|R) scan ;;
+      d|D) DRY_RUN=$((1 - DRY_RUN)); info "Dry run is now $([ "$DRY_RUN" -eq 1 ] && echo ON || echo OFF)" ;;
+      h|H|\?) usage ;;
+      *)
+        if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le $N ]; then
+          open_item $((choice - 1))
+        elif [ -n "$choice" ]; then
+          warn "Unknown choice '$choice'"
+        fi ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------- main ---
+
+main() {
+  local mode=interactive
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes)     ASSUME_YES=1 ;;
+      --scan)       mode=scan ;;
+      --safe)       mode=safe ;;
+      -h|--help)    usage; exit 0 ;;
+      -v|--version) echo "cleanX $VERSION"; exit 0 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+  done
+
+  [ "$(uname)" = Darwin ] || { err "cleanX only runs on macOS."; exit 1; }
+  xcrun simctl help >/dev/null 2>&1 && HAS_SIMCTL=1
+  trap 'printf "\n"; exit 130' INT
+
+  case "$mode" in
+    scan) banner; scan; print_table ;;
+    safe) banner; warn_running; scan; clean_all_safe ;;
+    *) interactive ;;
+  esac
+}
+
+main "$@"
